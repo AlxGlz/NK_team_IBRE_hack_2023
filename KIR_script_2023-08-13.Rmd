@@ -1,0 +1,984 @@
+---
+title: "Evaluation of KIR-receptor impact on graft function disruption after allogeneic hematopoietic stem cell transplantation"
+date: "13.08.2023"
+output: 
+    html_document:
+        toc: true
+        toc_depth: 4
+        toc_float: true
+        theme: united
+---
+
+<style>
+hide {
+  background-color: #d6d6d6;
+  color: #d6d6d6;
+}
+hide:hover {
+  background-color: white;
+  color: black;
+}
+</style>
+
+<hide>Слайды на английском, а комментарии к коду на русском. Just deal with it :)</hide>
+
+```{r setup, include=FALSE}
+
+
+knitr::opts_chunk$set(echo = F,
+                      message = F,
+                      error = F,
+                      warning = F)
+
+library(tidyverse)
+library(readxl)
+library(gtsummary)
+library(survival)
+library(survminer)
+library(contsurvplot)
+library(rpart)
+library(rpart.plot)
+library(pROC)
+library(corrplot)
+library(corrr)
+library(Hmisc)
+library(rstatix)
+library(epiR)
+
+# Загрузка кастомных функций, чтобы не засорять основной скрипт
+
+eval(
+    parse(
+        "Scripts\\Custom_functions.R"
+    )
+)
+
+```
+
+
+
+```{r data_import}
+
+# Считываем данные для 
+
+data_KIR_raw <- readxl::read_xlsx("Data\\Kir_data.xlsx")
+
+```
+
+
+```{r KIRs_lists}
+
+# Считываем словарь для быстрого переименования переменных
+# А заодно делаем списки KIRов для удобного анализа
+
+KIR_names <- readxl::read_xlsx("Interim\\KIRs.xlsx")
+
+# Списко KIR для перекодирования в дихотомические факторы
+
+KIR_for_recode <- KIR_names %>% 
+    dplyr::filter(For_recode == 1) %>% 
+    pull(New_name)
+
+# Все KIR и взаимодействия для анализа
+
+KIR_list_all <- KIR_names %>% 
+    dplyr::filter(is.na(Skip)) %>% 
+    pull(New_name)
+
+# Список показателей, характеризующих несовпадения лигандов и рецепторов
+
+KIR_list_mismatches <- KIR_names %>% 
+    dplyr::filter(Mismatches == 1) %>% 
+    pull(New_name)
+
+# Список рецепторов у пациента
+
+KIR_list_1 <- KIR_names %>% 
+    dplyr::filter(KIR_list_1 == 1) %>% 
+    pull(New_name)
+
+```
+
+
+```{r data_format}
+
+# Переводим данные из длинного в широкий формат
+
+data_KIR_wide_all <- data_KIR_raw %>% 
+    mutate(
+        `Результаты исследований.Материал/Популяция` = `Результаты исследований.Материал/Популяция` %>% 
+            factor(levels = KIR_names$Old_name,
+                   labels = KIR_names$New_name)
+    ) %>% 
+    pivot_wider(names_from = `Результаты исследований.Материал/Популяция`,
+                values_from = `Результаты исследований.Результат измерения`) %>% 
+    # Создаём уникальный id для каждой трансплантации
+    mutate(id = str_c(Patient, "_", Age),
+           .before = everything()) %>%
+    # Вычисляем переменные для анализа выживаемости
+    mutate(death_time = ifelse(Death == "yes",
+                              difftime(`date of death`, `Date of BMT`, units = "days") / 30,
+                              difftime(`Date of last contact`, `Date of BMT`, units = "days") / 30),
+           death_01 = ifelse(Death == "yes", 1, 0)) %>%     
+    # Вычисляем переменные для анализа времени до гипофункции / отторжения    
+    mutate(hypo_time = ifelse(`Отторжение` == "Да",
+                              difftime(`Дата отторжения`, `Date of BMT`, units = "days") / 30,
+                              difftime(`Date of last contact`, `Date of BMT`, units = "days") / 30),
+           hypo_01 = ifelse(`Отторжение` == "Да", 1, 0)) %>% 
+    mutate(Hypofunction = `Отторжение` %>% 
+               recode_factor("Да" = "yes",
+                             "Нет" = "no")) %>%
+    # Перекодируем факторы в красивые значения
+    mutate(`Transplantation type` = recode_factor(`Transplantation type`,
+        "аллогенная неродственная несовместимая" = "mismatch\nunrelated\ndonor",
+        "аллогенная неродственная совместимая" = "match\nunrelated\ndonor",
+        "аллогенная родственная несовместимая" = "mismatch\nrelated\ndonor",
+        "аллогенная родственная несовместимая (гаплоидентичная)" = "mismatch\nrelated\ndonor"
+    )) %>% 
+    mutate(Failure = recode_factor(`failure type`,
+                                   .missing = "None",
+                                   "Primary graft failure (+28 days)" = "Primary",
+                                   "Primary graft failure with restoration of own hematopoiesis (+28 day)" = "Primary",
+                                   "Primary graft hypofunction (2 shoots within 2 weeks)" = "Primary",
+                                   "Secondary graft failure (after engraftment)" = "Secondary",
+                                   "Secondary graft hypofunction (2 shoots within 2 weeks)" = "Secondary"
+                                   ))
+
+# Фильтруем датасет, чтобы оставить только консистентных пациентов
+
+data_KIR_wide <- data_KIR_wide_all  %>% 
+    dplyr::filter((Diagnosis == "ALL" | Diagnosis == "AML"),
+                  `Disease status` == "CR", 
+                  `conditioning regime` == "RIC")
+   
+# Из любопытства смотрим, а как много пациентов померло раньше 30 дней в полном датасете
+
+# data_KIR_wide_all %>% 
+#     filter(death_time < 30)
+
+# data_KIR_wide %>%
+#     summary()
+
+```
+
+# Методы анализа
+
+Расчёт проведён в R studio 2023.06.1 Build 524 с помощью языка R версии 4.3.0.
+Для описания категориальных переменных были рассчитаны абсолютные (n) и относительные 
+(%) частоты. Для количественных переменных рассчитывали медианы, размах минимум-максимум, 
+интерквартильные диапазоны. Сравнение категориальных переменных в двух группах проводили 
+с помощью критерия Хи-квадрат либо точного критерия Фишера, сравнение количественных 
+переменных - с помощью критерия Вилкоксона-Манна-Уитни с помощью пакета gtsummary 1.7.1. 
+Корреляционный анализ проводили с помощью коэффициента корреляции Пирсона.
+Для предикции развития исхода проводили построение моделей логистической регрессии.
+Анализ времени до наступления исходов проводили с помощью построения кривых Каплана-Майера и 
+построения моделей логистической регрессии Кокса.
+Уровень ошибки первого рода был принят равным 0.05, нулевые гипотезы отвергали при p < 0.05.
+
+Данное исследование являлось поисковым. 
+Нами была поставлена цель проверить возможность использования 
+данных о наличии KIR-рецепторов для прогнозирования несостоятельности графта.
+В связи с этим и с малым объёмом выборки (n = 69) набор данных не разделяли на train и test.
+Полученные результаты нуждаются в дополнительной внутренней и внешней валидации.
+
+
+# Задачи проекта
+
+Task 1: Identify KIR landscape in donor-recipient pairs and their combination.
+
+Task 2: Find associations between types of transplantation and KIR landscape.
+
+Task 3: Using biostatistics and machine learning methods identify the 
+relationship between KIR in donor-recipient pairs and transplant outcomes.
+
+Task 4: Find associations of KIR clusters and the function of the transplant.
+
+
+# Клиническая характеристика группы, включённой в анализ
+
+Табличка для слайда "Материал и методы"
+
+```{r}
+
+data_KIR_wide %>% 
+    dplyr::select(
+        Age,
+        Sex,
+        Diagnosis,
+        `BMT number`,
+        `Transplantation`,
+        Failure
+    ) %>% 
+    mutate(`BMT number` = `BMT number` %>% as.factor()) %>% 
+    tbl_summary(
+        type = list(where(is.numeric) ~ "continuous"),
+        statistic = list(all_continuous() ~ "{median} ({p25}, {p75}); {min} to {max}"))
+
+# data_KIR_wide %>% names()
+
+```
+
+## Данные по KIR-рецепторам в анализируемой группе
+
+В данном и трёх последующих разделах проведён анализ данных по задачам 1 и 2.
+Проанализирован "лашдшафт" встречаемости рецепторов, а также 
+проанализированы ассоциации между встречаемостью рецепторов и
+видом родственной трансплантации.
+
+```{r}
+
+data_KIR_wide %>% 
+        # Перекодируем переменные из 1/2
+    mutate(
+        across(
+            KIR_for_recode,
+            ~ recode_factor(.x,
+                            "1" = "yes",
+                            "2" = "no")
+        )
+    ) %>%
+    dplyr::select(
+        # `Отторжение`,
+        # `Гипофункция трансплантата`,
+        all_of(KIR_list_all)) %>% 
+    tbl_summary(
+        type = list(where(is.numeric) ~ "continuous"),
+        statistic = list(all_continuous() ~ "{median} ({p25}, {p75}); {min} to {max}"))
+
+
+```
+
+## КИРы избранные, у донора
+
+```{r}
+
+data_KIR_wide %>% 
+    # Перекодируем переменные из 1/2 в 1/0
+    mutate(
+        across(
+            KIR_for_recode,
+            ~ recode_factor(.x,
+                            "1" = "yes",
+                            "2" = "no")
+        )
+    ) %>%    
+    dplyr::select(
+        all_of(KIR_list_all[1:10])) %>% 
+    tbl_summary() 
+
+```
+
+
+## Анализ ассоциации между KIR
+
+```{r, fig.width=5, fig.height=5, dpi=300}
+
+data_KIR_wide %>% 
+    select(all_of(KIR_list_1)) %>% 
+    mutate(across(everything(),
+                  ~ if_else(.x == 1,
+                            1, 0))) %>%     
+    as.matrix() %>% 
+    rcorr() -> cor_res
+
+corrplot(cor_res$r,
+         method = "square",
+         p.mat = cor_res$P,
+         insig = "blank",
+         tl.cex = 0.8,
+         tl.srt = 0,
+         tl.offset = 1,
+         diag = F,
+         col = colorRampPalette(c("darkblue","white","darkred"))(100))
+
+```
+
+```{r, fig.width=4, fig.height=5, dpi=300}
+
+data_KIR_wide %>% 
+    select(all_of(KIR_list_1)) %>% 
+    mutate(across(everything(),
+                  ~ if_else(.x == 1,
+                            1, 0))) %>% 
+    correlate() %>% 
+    network_plot(colors = c("darkblue","white","darkred"))
+
+```
+
+
+## Анализ связи с видом трансплантации
+
+
+```{r}
+
+data_KIR_wide %>% 
+        # Перекодируем переменные из 1/2
+    mutate(
+        across(
+            KIR_for_recode,
+            ~ recode_factor(.x,
+                            "1" = "yes",
+                            "2" = "no")
+        )
+    ) %>%    
+    dplyr::select(all_of(KIR_list_mismatches),
+                  `Transplantation type`) %>% 
+    filter(`Transplantation type` != "match\nunrelated\ndonor") %>%
+    droplevels() %>% 
+    tbl_summary(
+        type = list(where(is.numeric) ~ "continuous"),
+        statistic = list(all_continuous() ~ "{median} ({p25}, {p75}); {min} to {max}"), 
+        by = `Transplantation type`) %>% 
+    add_p() %>% 
+    modify_spanning_header(c(stat_1, stat_2) ~ "**Transplantation type**")
+
+```
+
+
+# Анализ по гипофункции трансплантата
+
+## Демография + Анамнез
+
+```{r}
+
+data_KIR_wide %>% 
+    dplyr::select(
+        Age,
+        Sex,
+        Diagnosis,
+        `BMT number`,
+        `Transplantation`,
+        Failure,
+        hypo_01
+    ) %>% 
+    mutate(`BMT number` = `BMT number` %>% as.factor()) %>% 
+    tbl_summary(
+        type = list(where(is.numeric) ~ "continuous"),
+        statistic = list(all_continuous() ~ "{median} ({p25}, {p75}); {min} to {max}"),   
+        by = hypo_01) %>% 
+    add_p() %>% 
+    modify_spanning_header(c(stat_1, stat_2) ~ "**Hypofunction**")
+
+```
+
+
+```{r, fig.width=4.5, fig.height=3, dpi = 300}
+
+data_KIR_wide %>%
+    mutate(Hypofunction = hypo_01 %>% recode_factor(
+        "0" = "No hypofunction",
+        "1" = "Hypofunction"
+    )) %>% 
+    simple_plot_col("Transplantation", "Hypofunction") + 
+    labs(y = "Proportion of patients, %")
+
+```
+
+
+## КИРы все
+
+```{r}
+
+data_KIR_wide %>% 
+    # Перекодируем переменные из 1/2
+    mutate(
+        across(
+            KIR_for_recode,
+            ~ recode_factor(.x,
+                            "1" = "yes",
+                            "2" = "no")
+        )
+    ) %>%    
+    dplyr::select(
+        hypo_01,
+        all_of(KIR_list_all)) %>% 
+    tbl_summary(by = hypo_01,
+                percent = "row",
+                type = list(all_categorical() ~ "categorical",
+                            where(is.numeric) ~ "continuous")) %>% 
+    add_p() %>% 
+    modify_spanning_header(c(stat_1, stat_2) ~ "**Hypofunction**")
+
+```
+
+## Графики
+
+```{r, fig.width=4.5, fig.height=3, dpi = 300}
+
+data_KIR_wide %>%
+    mutate(Hypofunction = hypo_01 %>% recode_factor(
+        "0" = "No hypofunction",
+        "1" = "Hypofunction"
+    )) %>% 
+    simple_plot_col("Transplantation", "Hypofunction") + 
+    labs(y = "Proportion of patients, %")
+
+```
+
+```{r, fig.width=4.5, fig.height=3, dpi = 300}
+
+data_KIR_wide %>%
+    # Перекодируем переменные из 1/2
+    mutate(
+        across(
+            KIR_for_recode,
+            ~ recode_factor(.x,
+                            "1" = "yes",
+                            "2" = "no")
+        )
+    ) %>%       
+    mutate(Hypofunction = hypo_01 %>% recode_factor(
+        "0" = "No hypofunction",
+        "1" = "Hypofunction"
+    )) %>% 
+    simple_plot_col("2DS4f", "Hypofunction") + 
+    labs(y = "Proportion of patients, %")
+
+```
+
+```{r, fig.width=4.5, fig.height=3, dpi = 300}
+
+data_KIR_wide %>%
+    # Перекодируем переменные из 1/2
+    mutate(
+        across(
+            KIR_for_recode,
+            ~ recode_factor(.x,
+                            "1" = "yes",
+                            "2" = "no")
+        )
+    ) %>%       
+    mutate(Hypofunction = hypo_01 %>% recode_factor(
+        "0" = "No hypofunction",
+        "1" = "Hypofunction"
+    )) %>% 
+    simple_plot_col("Mismatching in the GvH Direction, HLA-A03/11", "Hypofunction") + 
+    labs(y = "Proportion of patients, %",
+         x = "Mismatching in the\nGvH Direction, HLA-A03/11")
+
+```
+
+
+## Попытка создания критерия оценки для наступления недостаточности
+
+В данном разделе проводился анализ по задачам 3 и 4: были проанализированы факторы, которые 
+влияли на развитие гипофункции трансплантата, разработана модель для прогнозирования 
+гипофункции трансплантата.
+
+### Однофакторная логистическая регрессия
+
+#### Анамнез + демография
+
+```{r}
+
+data_KIR_wide %>% 
+    dplyr::select(
+        Age,
+        Sex,
+        Diagnosis,
+        `BMT number`,
+        `Transplantation`,
+        hypo_01) %>% 
+    tbl_uvregression(
+        method=glm,
+        method.args = list(family = binomial),
+        y = hypo_01,
+        exponentiate = TRUE)
+
+```
+
+#### KIR
+
+```{r}
+
+data_KIR_wide %>% 
+    mutate(across(KIR_for_recode,
+                  ~ if_else(.x == 1,
+                            1, 0))) %>% 
+    dplyr::select(all_of(KIR_list_all),
+                  hypo_time,
+                  hypo_01) %>% 
+    tbl_uvregression(
+        method=glm,
+        method.args = list(family = binomial),
+        y = hypo_01,
+        exponentiate = TRUE)
+
+```
+
+## Модель из нескольких факторов
+
+```{r}
+
+model_log_mult <- glm(hypo_01 ~ Age + `2DS4f` + Transplantation + `Mismatching in the GvH Direction, HLA-A03/11`,
+                      family = binomial,
+                      data = data_KIR_wide)
+
+```
+
+### Проверка модели
+
+Смотрим, не хуже ли работает модель, чем классификаторы по-отдельности
+
+```{r, fig.height = 3, fig.width = 4.7, dpi = 300}
+
+data_KIR_wide <- data_KIR_wide %>% 
+    mutate(Predicted_hypo = predict(model_log_mult, data_KIR_wide, type = "response"))
+
+log_roc <- data_KIR_wide %>% 
+    roc(hypo_01, Predicted_hypo, ci = T)
+
+age_roc <- data_KIR_wide %>% 
+    roc(hypo_01, Age)
+
+kir_roc <- data_KIR_wide %>% 
+    roc(hypo_01, `2DS4f`)
+
+trans_roc <-  data_KIR_wide %>% 
+    mutate(Transplantation = ifelse(Transplantation == "BM",
+                                    1,0)) %>% 
+    roc(hypo_01, Transplantation)
+
+mismatch_roc <- data_KIR_wide %>% 
+    roc(hypo_01, `Mismatching in the GvH Direction, HLA-A03/11`)
+
+ggroc(list(Model = log_roc,
+           Age = age_roc,
+           `2DS4f` = kir_roc,
+           Transplantation = trans_roc,
+           `HLA mismatch` = mismatch_roc
+           ),
+      size = 1) + 
+    scale_color_manual(values = c("black",
+                                  "#F8766D", 
+                                  "#7CAE00", 
+                                  "#00BFC4", 
+                                  "#C77CFF" 
+                                  )) +
+    scale_alpha_manual(values = c(1,
+                                  0.7, 
+                                  0.7, 
+                                  0.7, 
+                                  0.7 
+                                  )) + 
+    theme_bw() + 
+    labs(x = "Specificity",
+         y = "Sensitivity",
+         color = "Predictor") + 
+    geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1),
+                 linetype = "dashed",
+                 color = "black",
+                 size = 0.5)
+
+
+    
+```
+
+```{r}
+
+log_roc
+
+log_roc %>% coords(x = "best")
+
+performance_matrix <- data_KIR_wide %>% 
+    select(Predicted_hypo, hypo_01) %>%
+    mutate(Predicted_hypo = ifelse(Predicted_hypo > 0.58, 1, 0) %>% factor(levels = c(1, 0)),
+           hypo_01 = ifelse(hypo_01 == 1, 1, 0) %>% factor(levels = c(1, 0))) %>% 
+    table()
+
+performance_matrix
+
+epi.tests(performance_matrix, digits = 3)
+
+?epi.tests
+
+```
+
+
+## Дерево решений
+
+Этот анализ был пробным и не фигурирует в финальном отчёте
+
+```{r}
+
+dec_tree_1 <- rpart(hypo_01 ~ Age + Transplantation + `2DS4f`, data = data_KIR_wide,
+                    control = rpart.control(cp = 0.01, xval=10000))
+
+rpart.plot(dec_tree_1)
+
+data_KIR_wide %>%
+    mutate(Predicted_hypo = predict(dec_tree_1, data_KIR_wide))
+
+```
+
+
+## Анализ времени до наступления недостаточности
+
+```{r, fig.width=6, fig.height=2.7, dpi = 300}
+
+surv_hypo_1 <- surv_fit(Surv(hypo_time, hypo_01) ~ 1, data = data_KIR_wide %>% 
+                            mutate(hypo_time = ifelse(hypo_time > 12, 12, hypo_time)))
+
+surv_hypo_1 %>% 
+    ggsurvplot(
+        surv.scale = "percent",
+        legend = "none",
+        ggtheme = theme_bw()) + 
+    labs(y = "Graft survival probability",
+         x = "Time, months")
+
+```
+
+### Однофакторный анализ времени до наступления события
+
+#### Анамнез + демография
+
+```{r}
+
+data_KIR_wide %>% 
+    dplyr::select(
+        Age,
+        Sex,
+        Diagnosis,
+        `BMT number`,
+        `Transplantation`,
+        hypo_time,
+        hypo_01) %>% 
+    tbl_uvregression(
+        method=coxph,
+        y = Surv(time = hypo_time, event = hypo_01),
+        exponentiate = TRUE)
+
+```
+
+#### KIR
+
+```{r}
+
+data_KIR_wide %>% 
+    mutate(across(KIR_for_recode,
+                  ~ if_else(.x == 1,
+                            1, 0))) %>% 
+    dplyr::select(all_of(KIR_list_all),
+                  hypo_time,
+                  hypo_01) %>% 
+    tbl_uvregression(
+        method=coxph,
+        y = Surv(time = hypo_time, event = hypo_01),
+        exponentiate = TRUE
+)
+
+```
+
+### Иллюстрации для однофактороного анализа
+
+#### KIR
+
+```{r, fig.width=4, fig.height=2.7, dpi=300}
+
+data_KIR_wide %>% 
+    mutate(across(KIR_for_recode,
+                  ~ if_else(.x == 1,
+                            1, 0))) %>%     
+    simple_cox_uvregression(KIR_list_1,
+                            "hypo_01",
+                            "hypo_time") + 
+    labs(y = "KIR type",
+         x = "Hazard Ratio, HR")
+
+```
+
+
+#### HLA
+
+
+```{r, fig.width=6, fig.height=2.7, dpi=300}
+
+KIR_HLA <- KIR_names %>% 
+    dplyr::filter(HLA_list == 1) %>% 
+    pull(New_name)
+
+
+data_KIR_wide %>% 
+    mutate(across(KIR_for_recode,
+                  ~ if_else(.x == 1,
+                            1, 0))) %>%     
+    simple_cox_uvregression(KIR_HLA,
+                            "hypo_01",
+                            "hypo_time") + 
+    labs(y = "HLA",
+         x = "Hazard Ratio, HR")
+
+```
+
+
+
+#### Mismatches
+
+
+```{r, fig.width=6, fig.height=2.7, dpi=300}
+
+data_KIR_wide %>% 
+    mutate(across(KIR_for_recode,
+                  ~ if_else(.x == 1,
+                            1, 0))) %>%     
+    simple_cox_uvregression(KIR_list_mismatches,
+                            "hypo_01",
+                            "hypo_time") + 
+    labs(y = NULL,
+         x = "Hazard Ratio, HR")
+
+```
+
+
+### Кривые выживаемости для разных факторов
+
+#### Возраст
+
+```{r, fig.width=2.7, fig.height=2.7, dpi=300}
+
+data_KIR_wide %>% 
+    mutate(hypo_01 = hypo_01 %>% recode_factor(
+        "0" = "No hypofunction",
+        "1" = "Hypofunction"
+    )) %>% 
+    simple_plot_violin_2gr("Age", 
+                           "hypo_01", 
+                           jitter = F,
+                           y_shift_perc = 50) +
+    labs(x = "",
+         y = "Age, years")
+
+```
+
+
+```{r, fig.width=6, fig.height=2.7, dpi = 300}
+
+model_hypo_age <- coxph(Surv(hypo_time, hypo_01) ~ Age, data = data_KIR_wide, x = T)
+
+
+plot_surv_area(
+    data = data_KIR_wide,
+    variable = "Age",
+    time = "hypo_time",
+    status = "hypo_01",
+    model = model_hypo_age,
+    ylab = "Graft survival probability",
+    xlab = "Time, months") + 
+    scale_y_continuous(labels = scales::percent)
+
+
+```
+
+
+
+
+#### Тип трансплантата
+
+```{r, fig.width=7, fig.height=2.7, dpi = 300}
+
+surv_hypo_2 <- surv_fit(Surv(hypo_time, hypo_01) ~ Transplantation, data = data_KIR_wide %>% 
+                            mutate(hypo_time = ifelse(hypo_time > 12, 12, hypo_time)))
+
+surv_hypo_2 %>% 
+    ggsurvplot(
+        surv.scale = "percent",
+        legend.title = "Transplantation",
+        legend = "right",
+        legend.labs = c("BM", "PBSC"),
+        ggtheme = theme_bw()) + 
+    labs(y = "Graft survival probability",
+         x = "Time, months")
+
+```
+
+#### Наличие 2DS4f KIR-рецептора
+
+```{r, fig.width=7, fig.height=2.7, dpi = 300}
+
+surv_hypo_3 <- surv_fit(Surv(hypo_time, hypo_01) ~ kir_2DS4f, data = data_KIR_wide %>% 
+                            rename(kir_2DS4f = `2DS4f`) %>% 
+                            mutate(hypo_time = ifelse(hypo_time > 12, 12, hypo_time)))
+
+surv_hypo_3 %>% 
+    ggsurvplot(
+        surv.scale = "percent",
+        legend.title = "2DS4f",
+        legend = "right",
+        legend.labs = c("yes", "no"),
+        ggtheme = theme_bw()) + 
+    labs(y = "Graft survival probability",
+         x = "Time, months")
+
+```
+
+#### Mismatching in the GvH Direction, HLA-A03/11
+
+```{r, fig.width=7, fig.height=2.7, dpi = 300}
+
+surv_hypo_4 <- surv_fit(Surv(hypo_time, hypo_01) ~ Mis_hla_03, data = data_KIR_wide %>% 
+                            rename(Mis_hla_03 = `Mismatching in the GvH Direction, HLA-A03/11`) %>% 
+                            mutate(hypo_time = ifelse(hypo_time > 12, 12, hypo_time)))
+
+surv_hypo_4 %>% 
+    ggsurvplot(
+        surv.scale = "percent",
+        legend.title = "Mismatching in\nthe GvH direction,\nHLA-A03/11",
+        legend = "right",
+        legend.labs = c("yes", "no"),
+        ggtheme = theme_bw()) + 
+    labs(y = "Graft survival probability",
+         x = "Time, months")
+
+```
+
+
+#### Модель, которая учитывает все факторы
+
+```{r, fig.width=2.7, fig.height=2.7, dpi=300}
+
+data_KIR_wide %>% 
+    mutate(hypo_01 = hypo_01 %>% recode_factor(
+        "0" = "No hypofunction",
+        "1" = "Hypofunction"
+    )) %>% 
+    simple_plot_violin_2gr("Predicted_hypo", 
+                           "hypo_01", 
+                           jitter = F,
+                           y_shift_perc = 10,
+                           trim = T) +
+    scale_y_continuous(breaks = seq(0, 1, 0.2)) +
+    labs(x = "",
+         y = "Predicted probability")
+
+```
+
+
+```{r, fig.width=6, fig.height=2.7, dpi = 300}
+
+model_hypo_log <- coxph(Surv(hypo_time, hypo_01) ~ Predicted_hypo, data = data_KIR_wide, x = T)
+
+
+plot_surv_area(
+    data = data_KIR_wide,
+    variable = "Predicted_hypo",
+    time = "hypo_time",
+    status = "hypo_01",
+    model = model_hypo_log,
+    ylab = "Graft survival probability",
+    xlab = "Time, months",
+    title.legend = "Preiction by\nlogistic regression\nmodel") + 
+    scale_y_continuous(labels = scales::percent)
+
+
+```
+
+# Анализ общей выживаемости
+
+## Демография + Анамнез
+
+```{r}
+
+data_KIR_wide %>% 
+    dplyr::select(
+        Age,
+        Sex,
+        Diagnosis,
+        `BMT number`,
+        `Transplantation`,
+        Failure,
+        death_01
+    ) %>% 
+    tbl_summary(by = death_01) %>% 
+    add_p() %>% 
+    modify_spanning_header(c(stat_1, stat_2) ~ "**Death**")
+
+```
+
+## КИРы
+
+```{r}
+
+data_KIR_wide %>% 
+    # Перекодируем переменные из 1/2 в 1/0
+    mutate(
+        across(
+            KIR_for_recode,
+            ~ recode_factor(.x,
+                            "1" = "yes",
+                            "2" = "no")
+        )
+    ) %>%    
+    dplyr::select(
+        death_01,
+        all_of(KIR_list_all)) %>% 
+    tbl_summary(by = death_01,
+                percent = "row",
+                type = list(all_categorical() ~ "categorical",
+                            where(is.numeric) ~ "continuous")) %>% 
+    add_p() %>% 
+    modify_spanning_header(c(stat_1, stat_2) ~ "**Death**")
+
+```
+
+
+## Время до наступления события
+
+```{r, fig.width=6, fig.height=2.7, dpi = 300}
+
+surv_death_1 <- surv_fit(Surv(death_time, death_01) ~ 1, data = data_KIR_wide %>% 
+                            mutate(death_time = ifelse(death_time > 36, 36, death_time)))
+
+surv_death_1 %>% 
+    ggsurvplot(
+        surv.scale = "percent",
+        legend = "none",
+        ggtheme = theme_bw(),
+        break.x.by = 4,
+        xlim = c(0, 36)) + 
+    labs(y = "Overall survival probability",
+         x = "Time, months") 
+
+```
+
+### Однофакторный анализ времени до наступления события
+
+#### Анамнез + демография
+
+```{r}
+
+data_KIR_wide %>% 
+    dplyr::select(
+        Age,
+        Sex,
+        Diagnosis,
+        `BMT number`,
+        `Transplantation`,
+        death_time,
+        death_01) %>% 
+    tbl_uvregression(
+        method=coxph,
+        y = Surv(time = death_time, event = death_01),
+        exponentiate = TRUE)
+
+```
+
+#### KIR
+
+```{r}
+
+data_KIR_wide %>% 
+    mutate(across(KIR_for_recode,
+                  ~ if_else(.x == 1,
+                            1, 0))) %>% 
+    dplyr::select(all_of(KIR_list_all),
+                  death_time,
+                  death_01) %>% 
+    tbl_uvregression(
+        method=coxph,
+        y = Surv(time = death_time, event = death_01),
+        exponentiate = TRUE
+)
+
+```
+
